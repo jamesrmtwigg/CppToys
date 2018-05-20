@@ -1,0 +1,5 @@
+#eclipse stuff
+.cproject
+.project
+build/
+maptest
