@@ -1,6 +1,8 @@
 #include <map>
 #include <chrono>
 #include <memory>
+#include <thread>
+#include <mutex>
 
 using namespace std;
 using namespace std::chrono;
@@ -34,6 +36,8 @@ private:
 	map<K,DecayingPointer<K,V>> dataByKey;
 	map<milliseconds, DecayingPointer<K,V>> dataByTtd;
 	milliseconds decayTime = milliseconds(5000);
+	thread janitor = thread(purgeExpired);
+	mutex mtx;
 
 	/**
 	 * Finds the element of dataByTtd with the given key and ttd, if it exists.
@@ -52,8 +56,49 @@ private:
 		return dataByTtd.end();
 	}
 
+	milliseconds millisUntil(milliseconds ms) {
+		return duration_cast<milliseconds>(ms - system_clock::now().time_since_epoch());
+	}
+
 	milliseconds nowPlusDecay() {
 		return duration_cast<milliseconds>(system_clock::now().time_since_epoch() + decayTime);
+	}
+
+	void purgeExpired() {
+		while (true) {
+			mtx.lock();
+			if(dataByTtd.empty()) {
+				mtx.unlock();
+				this_thread::sleep_for(decayTime);
+				continue;
+			}
+			//there are some elements in the map
+			milliseconds now = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
+			auto bound = dataByTtd.upper_bound(now);
+			if(bound == dataByTtd.begin()) {
+				//no elements have expired yet, sleep until the first expires
+				mtx.unlock();
+				this_thread::sleep_for(millisUntil(bound->first));
+				continue;
+			}
+			//delete expired elements
+			if(bound == dataByTtd.end()) {
+				//All elements expired, can simply clear.
+				dataByTtd.clear();
+				dataByKey.clear();
+				mtx.unlock();
+				this_thread::sleep_for(decayTime);
+				continue;
+			}
+
+			//some but not all elements expired
+			for(auto it = dataByTtd.begin(); it < bound; ++it) {
+				dataByKey.erase(it->second->key);
+			}
+			dataByTtd.erase(dataByTtd.begin(), bound);
+			mtx.unlock();
+			this_thread::sleep_for(millisUntil(bound->first));
+		}
 	}
 
 public:
@@ -68,6 +113,7 @@ public:
 	 * Returns a shared_ptr to the given object.
 	 */
 	shared_ptr<V> put(K key, V* value) {
+		lock_guard<mutex> lock(mtx);
 		erase(key);//does nothing if no key
 		milliseconds ttd = nowPlusDecay();
 		auto elem = DecayingPointer<K,V>(key, value, ttd);
@@ -83,6 +129,7 @@ public:
 	 * Otherwise does nothing and returns false.
 	 */
 	bool erase(K key) {
+		lock_guard<mutex> lock(mtx);
 		auto keyItr = dataByKey.find(key);
 		if(keyItr == dataByKey.end()) {
 			return false;
@@ -101,6 +148,7 @@ public:
 	 * If there is no element in the map with this key returns an empty ptr.
 	 */
 	shared_ptr<V> get(K key) {
+		lock_guard<mutex> lock(mtx);
 		auto keyItr = dataByKey.find(key);
 		if(keyItr == dataByKey.end()) {
 			return shared_ptr<V>();
