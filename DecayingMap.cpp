@@ -3,6 +3,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 using namespace std;
 using namespace std::chrono;
@@ -38,6 +39,7 @@ private:
 	milliseconds decayTime = milliseconds(5000);
 	thread janitor = thread(purgeExpired);
 	mutex mtx;
+	atomic_flag shutdownFlag = ATOMIC_FLAG_INIT;
 
 	/**
 	 * Finds the element of dataByTtd with the given key and ttd, if it exists.
@@ -66,6 +68,10 @@ private:
 
 	void purgeExpired() {
 		while (true) {
+			if(shutdownFlag.test_and_set(memory_order_acquire)){
+				//this object is being destructed
+				return;
+			}
 			mtx.lock();
 			if(dataByTtd.empty()) {
 				mtx.unlock();
@@ -104,6 +110,11 @@ private:
 public:
 	DecayingMap(long decayTime = 5000L) {
 		this->decayTime = milliseconds(decayTime);
+	}
+
+	~DecayingMap() {
+		shutdownFlag.test_and_set(memory_order_acq_rel);
+		janitor.join();
 	}
 
 	/**
