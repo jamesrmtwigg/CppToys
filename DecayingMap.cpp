@@ -4,14 +4,15 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
 
 using namespace std;
 using namespace std::chrono;
 
 template <class K, class V> class DecayingPointer {
-	milliseconds ttd;
-	K key;
-	shared_ptr<V> ptr;
+	milliseconds ttd;//Time To Die, the time (millis since unix epoch) when this object will decay (be destructed)
+	K key;//the key identifying this object
+	shared_ptr<V> ptr;//a ptr to the element.
 
 	DecayingPointer(K k, V* v, milliseconds ttd) : key(k), ttd(ttd) {
 		ptr = shared_ptr<V>(v);
@@ -25,21 +26,17 @@ template <class K, class V> class DecayingPointer {
  */
 template <class K, class V>
 class DecayingMap {
-/**
- * TODO
- * Launch Janitor thread which deletes expired elements.
- * How to schedule the janitor thread to wake up when an element decays.
- * How to REschedule the janitor when the next item to decay is refreshed.
- */
 
 private:
 	//Future project: a generic (templated) map with two keys. Or an arbitrary number?
 	map<K,DecayingPointer<K,V>> dataByKey;
 	map<milliseconds, DecayingPointer<K,V>> dataByTtd;
-	milliseconds decayTime = milliseconds(5000);
+	milliseconds decayTime;
 	thread janitor = thread(purgeExpired);
-	mutex mtx;
-	atomic_flag shutdownFlag = ATOMIC_FLAG_INIT;
+	mutex synchronization_mutex;
+	condition_variable janitor_wait_cv;
+	mutex janitor_wait_mutex;
+	bool shutdownFlag = false;
 
 	/**
 	 * Finds the element of dataByTtd with the given key and ttd, if it exists.
@@ -68,14 +65,16 @@ private:
 
 	void purgeExpired() {
 		while (true) {
-			if(shutdownFlag.test_and_set(memory_order_acquire)){
+			if(shutdownFlag){
 				//this object is being destructed
 				return;
 			}
-			mtx.lock();
+
+			unique_lock<mutex> lock(synchronization_mutex);
 			if(dataByTtd.empty()) {
-				mtx.unlock();
-				this_thread::sleep_for(decayTime);
+				//the map is empty, so now+decay is guaranteed to be before the next decay,
+				//which is the time of the next put plus decay. Wait and check again later.
+				janitor_wait_cv.wait_until(lock, nowPlusDecay());
 				continue;
 			}
 			//there are some elements in the map
@@ -83,8 +82,7 @@ private:
 			auto bound = dataByTtd.upper_bound(now);
 			if(bound == dataByTtd.begin()) {
 				//no elements have expired yet, sleep until the first expires
-				mtx.unlock();
-				this_thread::sleep_for(millisUntil(bound->first));
+				janitor_wait_cv.wait_until(lock, millisUntil(bound->first));
 				continue;
 			}
 			//delete expired elements
@@ -92,18 +90,16 @@ private:
 				//All elements expired, can simply clear.
 				dataByTtd.clear();
 				dataByKey.clear();
-				mtx.unlock();
-				this_thread::sleep_for(decayTime);
-				continue;
+				continue;//next iteration will find the map empty, release the lock, and wait
 			}
 
-			//some but not all elements expired
+			//some but not all elements expired, delete expired ones
 			for(auto it = dataByTtd.begin(); it < bound; ++it) {
 				dataByKey.erase(it->second->key);
 			}
 			dataByTtd.erase(dataByTtd.begin(), bound);
-			mtx.unlock();
-			this_thread::sleep_for(millisUntil(bound->first));
+			//sleep until next decay
+			janitor_wait_cv.wait_until(lock, millisUntil(bound->first));
 		}
 	}
 
@@ -113,7 +109,10 @@ public:
 	}
 
 	~DecayingMap() {
-		shutdownFlag.test_and_set(memory_order_acq_rel);
+		shutdownFlag = true;
+		unique_lock<mutex> lock(synchronization_mutex);
+		janitor_wait_cv.notify_all();
+		lock.release();
 		janitor.join();
 	}
 
@@ -124,7 +123,7 @@ public:
 	 * Returns a shared_ptr to the given object.
 	 */
 	shared_ptr<V> put(K key, V* value) {
-		lock_guard<mutex> lock(mtx);
+		lock_guard<mutex> lock(synchronization_mutex);
 		erase(key);//does nothing if no key
 		milliseconds ttd = nowPlusDecay();
 		auto elem = DecayingPointer<K,V>(key, value, ttd);
@@ -140,7 +139,7 @@ public:
 	 * Otherwise does nothing and returns false.
 	 */
 	bool erase(K key) {
-		lock_guard<mutex> lock(mtx);
+		lock_guard<mutex> lock(synchronization_mutex);
 		auto keyItr = dataByKey.find(key);
 		if(keyItr == dataByKey.end()) {
 			return false;
@@ -159,12 +158,14 @@ public:
 	 * If there is no element in the map with this key returns an empty ptr.
 	 */
 	shared_ptr<V> get(K key) {
-		lock_guard<mutex> lock(mtx);
+		lock_guard<mutex> lock(synchronization_mutex);
 		auto keyItr = dataByKey.find(key);
 		if(keyItr == dataByKey.end()) {
+			//no element with this key, return empty ptr
 			return shared_ptr<V>();
 		}
 		auto ttdItr = findByMillisAndKey(key, keyItr->ttd);
+		//remove from ttd->data map, then reinsert with updated ttd.
 		if(ttdItr != dataByTtd.end()) {
 			dataByTtd.erase(ttdItr);
 		}
